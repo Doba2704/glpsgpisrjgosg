@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  TITAN v5.0 ULTRA — Secured Edition                                         ║
-║  + Telegram PIN Auth (кожен вхід → PIN у Telegram)                          ║
+║  TITAN v5.0 ULTRA — Secured Edition (PIN fix via session_state)            ║
+║  + Telegram PIN Auth (зберігання PIN у st.session_state)                    ║
 ║  + MillionVerifier email validation                                         ║
 ║  + Advanced blocklists (investor pages, market reports, etc.)               ║
 ║  + Enrichment of existing CSV bases                                         ║
@@ -56,7 +56,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  КОНФІГУРАЦІЯ — ЗАПОВНІТЬ ПЕРЕД ДЕПЛОЄМ
+#  КОНФІГУРАЦІЯ — Telegram (вже заповнена)
 # ═══════════════════════════════════════════════════════════════════════════════
 TELEGRAM_BOT_TOKEN = "7834347258:AAGXPDoyemyNvfOqoZBeEB_5PFYNB7aRrDw"
 TELEGRAM_CHAT_ID   = "1913057855"
@@ -71,7 +71,7 @@ IP_BAN_SECONDS   = 3600   # 60 хвилин
 SESSION_TTL_MIN  = 240   # 2 години
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  ЗБЕРІГАННЯ СЕСІЙ / ПІНІВ / БАНІВ (в пам'яті + файл)
+#  ЗБЕРІГАННЯ СЕСІЙ / ПІНІВ / БАНІВ (в пам'яті + session_state)
 # ═══════════════════════════════════════════════════════════════════════════════
 _AUTH_LOCK = threading.Lock()
 
@@ -103,9 +103,7 @@ def _tg_send(text: str) -> bool:
 def _get_client_ip() -> str:
     """Витягує IP клієнта з Streamlit headers."""
     try:
-        # Для Streamlit Cloud / локального сервера
         headers = st.context.headers
-        # За проксі (Nginx / Cloudflare)
         for h in ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP"):
             val = headers.get(h, "")
             if val:
@@ -126,15 +124,21 @@ def _geo_lookup(ip: str) -> str:
         pass
     return "geo unknown"
 
-# ─────────── PIN генерація і верифікація ────────────────────
+# ─────────── PIN генерація і верифікація (з session_state) ───────────
 def generate_and_send_pin(ip: str) -> bool:
-    """Генерує 6-значний PIN, зберігає, відправляє в Telegram."""
-    pin = str(secrets.randbelow(900000) + 100000)  # 100000–999999
+    """Генерує PIN, зберігає в пам'яті та в st.session_state, відправляє в Telegram."""
+    pin = str(secrets.randbelow(900000) + 100000)
     expires = datetime.now() + timedelta(seconds=PIN_TTL_SECONDS)
     geo = _geo_lookup(ip)
+    
+    # Зберігаємо в глобальному словнику (для сумісності)
     with _AUTH_LOCK:
         _pending_pins[ip] = {"pin": pin, "expires": expires}
-
+    
+    # Також зберігаємо в st.session_state (для надійності між rerun)
+    st.session_state.temp_pin = pin
+    st.session_state.temp_pin_expires = expires
+    
     msg = (
         f"🔐 <b>TITAN — Новий вхід</b>\n\n"
         f"🌐 IP: <code>{ip}</code>\n"
@@ -148,8 +152,7 @@ def generate_and_send_pin(ip: str) -> bool:
 
 def verify_pin(ip: str, entered: str) -> Tuple[bool, str]:
     """
-    Перевіряє PIN.
-    Повертає (success, reason).
+    Перевіряє PIN. Спочатку перевіряє в st.session_state, потім у глобальному словнику.
     """
     # Перевіряємо бан
     with _AUTH_LOCK:
@@ -157,25 +160,43 @@ def verify_pin(ip: str, entered: str) -> Tuple[bool, str]:
     if ban_until and datetime.now() < ban_until:
         remaining = int((ban_until - datetime.now()).total_seconds())
         return False, f"IP заблоковано ще на {remaining} сек"
-
-    with _AUTH_LOCK:
-        data = _pending_pins.get(ip)
-
-    if not data:
+    
+    expected_pin = None
+    expires = None
+    
+    # Спершу з session_state
+    if st.session_state.temp_pin and st.session_state.temp_pin_expires:
+        expected_pin = st.session_state.temp_pin
+        expires = st.session_state.temp_pin_expires
+    
+    # Якщо немає в session_state, то з глобального словника
+    if not expected_pin:
+        with _AUTH_LOCK:
+            data = _pending_pins.get(ip)
+            if data:
+                expected_pin = data["pin"]
+                expires = data["expires"]
+    
+    if not expected_pin:
         return False, "PIN не знайдено — запросіть новий"
-
-    if datetime.now() > data["expires"]:
+    
+    if datetime.now() > expires:
+        # Очищаємо прострочений PIN
         with _AUTH_LOCK:
             _pending_pins.pop(ip, None)
+        st.session_state.temp_pin = None
+        st.session_state.temp_pin_expires = None
         return False, "PIN прострочено — запросіть новий"
-
-    if entered.strip() != data["pin"]:
+    
+    if entered.strip() != expected_pin:
         _fail_count[ip] += 1
         if _fail_count[ip] >= MAX_FAILED_TRIES:
             ban_until = datetime.now() + timedelta(seconds=IP_BAN_SECONDS)
             with _AUTH_LOCK:
                 _banned_ips[ip] = ban_until
                 _pending_pins.pop(ip, None)
+            st.session_state.temp_pin = None
+            st.session_state.temp_pin_expires = None
             _tg_send(
                 f"🚨 <b>TITAN — IP ЗАБЛОКОВАНО</b>\n"
                 f"IP <code>{ip}</code> зробив {MAX_FAILED_TRIES} невдалих спроб входу!\n"
@@ -184,11 +205,13 @@ def verify_pin(ip: str, entered: str) -> Tuple[bool, str]:
             return False, f"Забагато спроб — IP заблоковано на {IP_BAN_SECONDS // 60} хв"
         remaining = MAX_FAILED_TRIES - _fail_count[ip]
         return False, f"Невірний PIN. Залишилось спроб: {remaining}"
-
+    
     # PIN вірний
     _fail_count[ip] = 0
     with _AUTH_LOCK:
         _pending_pins.pop(ip, None)
+    st.session_state.temp_pin = None
+    st.session_state.temp_pin_expires = None
     return True, "OK"
 
 def create_session(ip: str) -> str:
@@ -211,7 +234,6 @@ def check_session(token: str, ip: str) -> bool:
         with _AUTH_LOCK:
             _active_sessions.pop(token, None)
         return False
-    # IP прив'язка (захист від крадіжки токена)
     if sess["ip"] != ip and ip != "unknown":
         return False
     return True
@@ -259,13 +281,11 @@ def render_auth_screen(ip: str):
         </div>
         """, unsafe_allow_html=True)
 
-        # Ініціалізація стану авторизації
         if "auth_pin_sent" not in st.session_state:
             st.session_state.auth_pin_sent = False
         if "auth_session" not in st.session_state:
             st.session_state.auth_session = ""
 
-        # Перевірка бану
         with _AUTH_LOCK:
             ban = _banned_ips.get(ip)
         if ban and datetime.now() < ban:
@@ -276,7 +296,6 @@ def render_auth_screen(ip: str):
         if not st.session_state.auth_pin_sent:
             st.info(f"🌐 Ваш IP: `{ip}`")
             st.markdown("Натисніть кнопку — PIN надійде у Telegram власника системи.")
-
             if st.button("📲 Надіслати PIN в Telegram", type="primary", use_container_width=True):
                 with st.spinner("Відправляємо PIN..."):
                     ok = generate_and_send_pin(ip)
@@ -288,12 +307,7 @@ def render_auth_screen(ip: str):
                     st.error("❌ Telegram недоступний. Перевірте налаштування бота.")
         else:
             st.success("📲 PIN надіслано в Telegram")
-            pin_input = st.text_input(
-                "Введіть 6-значний PIN",
-                max_chars=6,
-                placeholder="123456",
-                type="password"
-            )
+            pin_input = st.text_input("Введіть 6-значний PIN", max_chars=6, placeholder="123456", type="password")
             col_a, col_b = st.columns(2)
             with col_a:
                 if st.button("✅ Підтвердити", type="primary", use_container_width=True):
@@ -301,11 +315,7 @@ def render_auth_screen(ip: str):
                     if ok:
                         token = create_session(ip)
                         st.session_state.auth_session = token
-                        _tg_send(
-                            f"✅ <b>TITAN — Успішний вхід</b>\n"
-                            f"IP: <code>{ip}</code>\n"
-                            f"Час: {datetime.now().strftime('%H:%M:%S')}"
-                        )
+                        _tg_send(f"✅ <b>TITAN — Успішний вхід</b>\nIP: <code>{ip}</code>\nЧас: {datetime.now().strftime('%H:%M:%S')}")
                         st.success("✅ Авторизовано!")
                         time.sleep(0.5)
                         st.rerun()
@@ -314,11 +324,11 @@ def render_auth_screen(ip: str):
             with col_b:
                 if st.button("🔄 Новий PIN", use_container_width=True):
                     st.session_state.auth_pin_sent = False
+                    st.session_state.temp_pin = None
+                    st.session_state.temp_pin_expires = None
                     st.rerun()
+        st.stop()
 
-        st.stop()  # Зупиняємо рендер основного додатку
-
-# ─────────── Головний auth check ────────────────────────────
 def require_auth():
     """Виклик на початку кожного рендеру."""
     ip = _get_client_ip()
@@ -346,6 +356,8 @@ def _init_state():
         "log_tick": 0,
         "auth_session": "",
         "auth_pin_sent": False,
+        "temp_pin": None,
+        "temp_pin_expires": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -369,10 +381,7 @@ def _buf_log(msg: str, level: str = "info"):
     }
     color = COLORS.get(level, "#e2e8f0")
     t = time.strftime("%H:%M:%S")
-    entry = (
-        f'<span style="color:#475569;font-size:10px">[{t}]</span> '
-        f'<span style="color:{color}">{msg}</span>'
-    )
+    entry = f'<span style="color:#475569;font-size:10px">[{t}]</span> <span style="color:{color}">{msg}</span>'
     with _log_lock:
         _log_buffer.appendleft(entry)
 
@@ -462,7 +471,6 @@ def init_db():
                 FOREIGN KEY(campaign_id) REFERENCES campaigns(id)
             )
         """)
-        # Таблиця логів входу (аудит)
         c.execute("""
             CREATE TABLE IF NOT EXISTS access_log (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -486,10 +494,7 @@ init_db()
 def log_access(ip: str, event: str, details: str = ""):
     try:
         with sqlite3.connect(DB_PATH, timeout=10) as conn:
-            conn.execute(
-                "INSERT INTO access_log (ip, event, details) VALUES (?,?,?)",
-                (ip, event, details[:500])
-            )
+            conn.execute("INSERT INTO access_log (ip, event, details) VALUES (?,?,?)", (ip, event, details[:500]))
             conn.commit()
     except Exception:
         pass
@@ -553,10 +558,7 @@ def db_save_lead(row: dict):
 def create_campaign(name: str, theme_query: str, target_leads: int, client_id: str) -> int:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("""
-            INSERT INTO campaigns (name, theme_query, target_leads, client_id, status)
-            VALUES (?, ?, ?, ?, 'pending')
-        """, (name, theme_query, target_leads, client_id))
+        c.execute("INSERT INTO campaigns (name, theme_query, target_leads, client_id, status) VALUES (?, ?, ?, ?, 'pending')", (name, theme_query, target_leads, client_id))
         campaign_id = c.lastrowid
         conn.commit()
         return campaign_id
@@ -604,8 +606,7 @@ def complete_campaign(campaign_id: int, client_id: str, leads_df: pd.DataFrame):
         _buf_log(f"❌ Campaign {campaign_id}: webhook error {e}", "error")
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("UPDATE campaigns SET status='completed', completed_at=? WHERE id=?",
-                  (datetime.now(), campaign_id))
+        c.execute("UPDATE campaigns SET status='completed', completed_at=? WHERE id=?", (datetime.now(), campaign_id))
         c.execute("DELETE FROM queue WHERE campaign_id=?", (campaign_id,))
         conn.commit()
 
@@ -620,23 +621,18 @@ def get_all_campaigns() -> pd.DataFrame:
 # ======================== DEEPSEEK API ========================
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10),
        retry=retry_if_exception_type(Exception), reraise=True)
-def deepseek_call(prompt: str, system: str, api_key: str,
-                  json_mode: bool = True, max_tokens: int = 3500) -> Optional[Any]:
+def deepseek_call(prompt: str, system: str, api_key: str, json_mode: bool = True, max_tokens: int = 3500) -> Optional[Any]:
     try:
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload = {
             "model": "deepseek-chat",
-            "messages": [{"role": "system", "content": system},
-                         {"role": "user", "content": prompt}],
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "temperature": 0.2,
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        response = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers=headers, json=payload, timeout=60
-        )
+        response = requests.post("https://api.deepseek.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
         response.raise_for_status()
         raw = response.json()["choices"][0]["message"]["content"].strip()
         if not json_mode:
@@ -743,10 +739,7 @@ Return JSON: {{"queries": [...]}}"""
     result = deepseek_call(prompt, "Return only valid JSON.", api_key)
     ai_dorks = result.get("queries", []) if isinstance(result, dict) else []
     base = [d.format(q=enriched_query) for d in _BASE_DORKS]
-    country_dorks = [
-        f'{tld} "{enriched_query}" "CEO" "contact"'
-        for c, tld in COUNTRY_TLD.items() if c in target_countries
-    ]
+    country_dorks = [f'{tld} "{enriched_query}" "CEO" "contact"' for c, tld in COUNTRY_TLD.items() if c in target_countries]
     combined = ai_dorks + base + country_dorks
     seen, out = set(), []
     for d in combined:
@@ -761,39 +754,23 @@ _BLOCK_DOMAINS = {
     "linkedin.com", "facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com",
     "wikipedia.org", "crunchbase.com", "indeed.com", "glassdoor.com", "reddit.com", "quora.com",
     "dnb.com", "zoominfo.com", "apollo.io", "lusha.com", "yellowpages.com", "whitepages.com",
-    "amazon.com", "ebay.com", "yelp.com", "tripadvisor.com",
-    "g2.com", "capterra.com", "trustpilot.com", "clutch.co", "goodfirms.co",
-    "techcrunch.com", "forbes.com", "bloomberg.com", "reuters.com", "wsj.com", "ft.com",
-    "prnewswire.com", "businesswire.com", "globenewswire.com", "accesswire.com",
-    "einpresswire.com", "prlog.org", "prweb.com",
-    "marketresearch.com", "grandviewresearch.com", "mordorintelligence.com",
-    "marketsandmarkets.com", "alliedmarketresearch.com", "statista.com",
-    "businessresearchinsights.com", "verifiedmarketresearch.com",
-    "intellectualmarketinsights.com", "marketreportanalytics.com",
-    "researchandmarkets.com", "reportlinker.com",
-    "databridgemarketresearch.com", "fortunebusinessinsights.com",
-    "marketwatch.com", "seekingalpha.com", "businessinsider.com",
-    "siliconangle.com", "venturebeat.com", "zdnet.com", "cnet.com",
-    "wired.com", "theverge.com", "engadget.com", "gizmodo.com",
-    "plasticsnews.com", "rubbernews.com", "chemicalweek.com", "icis.com",
-    "industrydive.com", "supplychain247.com", "logisticsmgmt.com",
-    "q4cdn.com", "ir.net", "prnews.io", "sec.gov",
-    "medium.com", "substack.com", "wordpress.com", "blogger.com",
-    "jobs.lever.co", "greenhouse.io", "workday.com", "bamboohr.com",
+    "amazon.com", "ebay.com", "yelp.com", "tripadvisor.com", "g2.com", "capterra.com",
+    "trustpilot.com", "clutch.co", "goodfirms.co", "techcrunch.com", "forbes.com",
+    "bloomberg.com", "reuters.com", "wsj.com", "ft.com", "prnewswire.com", "businesswire.com",
+    "globenewswire.com", "accesswire.com", "einpresswire.com", "prlog.org", "prweb.com",
+    "marketresearch.com", "grandviewresearch.com", "mordorintelligence.com", "marketsandmarkets.com",
+    "alliedmarketresearch.com", "statista.com", "businessresearchinsights.com", "verifiedmarketresearch.com",
+    "intellectualmarketinsights.com", "marketreportanalytics.com", "researchandmarkets.com", "reportlinker.com",
+    "databridgemarketresearch.com", "fortunebusinessinsights.com", "marketwatch.com", "seekingalpha.com",
+    "businessinsider.com", "siliconangle.com", "venturebeat.com", "zdnet.com", "cnet.com",
+    "wired.com", "theverge.com", "engadget.com", "gizmodo.com", "plasticsnews.com", "rubbernews.com",
+    "chemicalweek.com", "icis.com", "industrydive.com", "supplychain247.com", "logisticsmgmt.com",
+    "q4cdn.com", "ir.net", "prnews.io", "sec.gov", "medium.com", "substack.com", "wordpress.com",
+    "blogger.com", "jobs.lever.co", "greenhouse.io", "workday.com", "bamboohr.com"
 }
-_BLOCK_EXTENSIONS = (
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-    ".zip", ".rar", ".tar", ".gz", ".mp4", ".mp3", ".avi",
-    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".xml", ".json", ".csv",
-)
+_BLOCK_EXTENSIONS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".rar", ".tar", ".gz", ".mp4", ".mp3", ".avi", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".xml", ".json", ".csv")
 _BLOCK_TLDS = (".gov", ".edu", ".ac.uk", ".mil")
-_BLOCK_URL_PATTERNS = (
-    "/sites/default/files/", "/wp-content/uploads/", "/content/uploads/",
-    "/doc_financials/", "/files/doc_", "/system/files/",
-    "/news-releases/news-release-details/",
-    "/investor-relations/press-releases/",
-    "q4cdn.com", "ir.net/",
-)
+_BLOCK_URL_PATTERNS = ("/sites/default/files/", "/wp-content/uploads/", "/content/uploads/", "/doc_financials/", "/files/doc_", "/system/files/", "/news-releases/news-release-details/", "/investor-relations/press-releases/", "q4cdn.com", "ir.net/")
 
 def _is_blocked_domain(domain: str) -> bool:
     for b in _BLOCK_DOMAINS:
@@ -819,11 +796,7 @@ def serper_validate_key(key: str) -> Tuple[bool, str]:
     if not key or len(key) < 10:
         return False, "Ключ порожній або занадто короткий"
     try:
-        r = requests.post(
-            "https://google.serper.dev/search",
-            headers={"X-API-KEY": key, "Content-Type": "application/json"},
-            json={"q": "test", "num": 1}, timeout=15
-        )
+        r = requests.post("https://google.serper.dev/search", headers={"X-API-KEY": key, "Content-Type": "application/json"}, json={"q": "test", "num": 1}, timeout=15)
         if r.status_code == 200:
             return True, "OK"
         return False, f"HTTP {r.status_code}"
@@ -832,21 +805,13 @@ def serper_validate_key(key: str) -> Tuple[bool, str]:
 
 def _serper_one(query: str, key: str, num: int = 10) -> list:
     try:
-        r = requests.post(
-            "https://google.serper.dev/search",
-            headers={"X-API-KEY": key, "Content-Type": "application/json"},
-            json={"q": query, "num": num, "gl": "com"}, timeout=30
-        )
+        r = requests.post("https://google.serper.dev/search", headers={"X-API-KEY": key, "Content-Type": "application/json"}, json={"q": query, "num": num, "gl": "com"}, timeout=30)
         if r.status_code == 200:
             return r.json().get("organic", [])
         elif r.status_code == 429:
             _buf_log("⚠️ Serper 429 – пауза 10 сек", "warn")
             time.sleep(10)
-            r2 = requests.post(
-                "https://google.serper.dev/search",
-                headers={"X-API-KEY": key, "Content-Type": "application/json"},
-                json={"q": query, "num": num, "gl": "com"}, timeout=30
-            )
+            r2 = requests.post("https://google.serper.dev/search", headers={"X-API-KEY": key, "Content-Type": "application/json"}, json={"q": query, "num": num, "gl": "com"}, timeout=30)
             return r2.json().get("organic", []) if r2.status_code == 200 else []
         elif r.status_code == 400:
             _buf_log("⚠️ Serper 400 – query not allowed", "warn")
@@ -889,31 +854,16 @@ def collect_urls(dorks: list, serper_key: str, max_total: int) -> list:
                 _buf_log(f"⛔ Пропускаємо файл/IR: {link[:70]}...", "skip")
                 continue
             seen_domains.add(domain)
-            results.append({
-                "url": link, "domain": domain,
-                "title": item.get("title", ""),
-                "snippet": item.get("snippet", "")
-            })
+            results.append({"url": link, "domain": domain, "title": item.get("title", ""), "snippet": item.get("snippet", "")})
             added += 1
-        _buf_log(
-            f"🔎 [{i+1}/{len(dorks)}] +{added} сайтів → всього {len(results)}/{max_total}",
-            "system" if added > 0 else "skip"
-        )
+        _buf_log(f"🔎 [{i+1}/{len(dorks)}] +{added} сайтів → всього {len(results)}/{max_total}", "system" if added > 0 else "skip")
         time.sleep(0.5)
     return results[:max_total]
 
 # ======================== SCRAPING ========================
 _EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-_CONTACT_PATHS = [
-    "/contact", "/contact-us", "/contacts", "/get-in-touch",
-    "/about", "/about-us", "/team", "/our-team",
-    "/impressum", "/imprint", "/kontakt", "/company"
-]
-_EMAIL_SKIP = {
-    "sentry.io", "amazonaws.com", "cloudflare.com", "google.com",
-    "w3.org", "schema.org", "example.com", "yourdomain.com",
-    "email.com", "domain.com", "test.com"
-}
+_CONTACT_PATHS = ["/contact", "/contact-us", "/contacts", "/get-in-touch", "/about", "/about-us", "/team", "/our-team", "/impressum", "/imprint", "/kontakt", "/company"]
+_EMAIL_SKIP = {"sentry.io", "amazonaws.com", "cloudflare.com", "google.com", "w3.org", "schema.org", "example.com", "yourdomain.com", "email.com", "domain.com", "test.com"}
 
 def _clean_emails(raw: list) -> list:
     out = []
@@ -922,9 +872,7 @@ def _clean_emails(raw: list) -> list:
         dom = e.split("@")[-1]
         if dom in _EMAIL_SKIP or "." not in dom:
             continue
-        if any(x in e for x in ("noreply", "no-reply", "donotreply",
-                                  "abuse@", "postmaster@", "webmaster@",
-                                  "example", "test@")):
+        if any(x in e for x in ("noreply", "no-reply", "donotreply", "abuse@", "postmaster@", "webmaster@", "example", "test@")):
             continue
         out.append(e)
     return out
@@ -943,9 +891,7 @@ async def _page_get(page, url: str, timeout: int = 20000):
         await _human_like_delay()
         text = await page.evaluate("document.body ? document.body.innerText : ''") or ""
         html = await page.content() or ""
-        mailto = re.findall(
-            r"mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", html, re.I
-        )
+        mailto = re.findall(r"mailto:([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})", html, re.I)
         plain = _EMAIL_RE.findall(text)
         return text, list(set(mailto + plain))
     except Exception as e:
@@ -954,8 +900,7 @@ async def _page_get(page, url: str, timeout: int = 20000):
 
 async def deep_scrape(base_url: str, browser, depth: int, proxy: Optional[str] = None):
     ctx_options = {
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "viewport": {"width": 1280, "height": 800},
         "ignore_https_errors": True,
     }
@@ -963,10 +908,7 @@ async def deep_scrape(base_url: str, browser, depth: int, proxy: Optional[str] =
         ctx_options["proxy"] = {"server": proxy}
     ctx = await browser.new_context(**ctx_options)
     page = await ctx.new_page()
-    await page.route(
-        "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,eot,mp4,mp3,pdf}",
-        lambda r: r.abort()
-    )
+    await page.route("**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,eot,mp4,mp3,pdf}", lambda r: r.abort())
     all_text, all_emails = "", []
     try:
         text, emails = await _page_get(page, base_url)
@@ -993,30 +935,20 @@ async def deep_scrape(base_url: str, browser, depth: int, proxy: Optional[str] =
 # ======================== INTENT / SOCIAL / DMU ========================
 async def get_intent_hiring(company: str, domain: str, serper_key: str) -> Dict:
     hiring = {"roles": [], "platforms": []}
-    queries = [
-        f'site:greenhouse.io "{company}" OR "{domain}"',
-        f'site:lever.co "{company}" OR "{domain}"',
-        f'site:workable.com "{company}" OR "{domain}"'
-    ]
+    queries = [f'site:greenhouse.io "{company}" OR "{domain}"', f'site:lever.co "{company}" OR "{domain}"', f'site:workable.com "{company}" OR "{domain}"']
     for q in queries:
         items = _serper_one(q, serper_key, num=5)
         for item in items:
             title = item.get("title", "")
             hiring["platforms"].append(q.split("site:")[1].split()[0])
-            roles = re.findall(
-                r"(Head of|Director|VP|Manager|DevOps|Engineer|Sales|Marketing|Product|IT)",
-                title, re.I
-            )
+            roles = re.findall(r"(Head of|Director|VP|Manager|DevOps|Engineer|Sales|Marketing|Product|IT)", title, re.I)
             hiring["roles"].extend(roles)
         await asyncio.sleep(0.4)
     hiring["roles"] = list(set(hiring["roles"]))[:5]
     return hiring
 
 async def get_social_proof(company: str, domain: str, serper_key: str) -> str:
-    queries = [
-        f'"{company}" news after:2025-01-01',
-        f'"{domain}" award OR recognition OR "named" "leader"'
-    ]
+    queries = [f'"{company}" news after:2025-01-01', f'"{domain}" award OR recognition OR "named" "leader"']
     for q in queries:
         items = _serper_one(q, serper_key, num=3)
         for item in items:
@@ -1050,22 +982,14 @@ async def find_dmu(company: str, domain: str, serper_key: str) -> Dict[str, str]
     return dmu
 
 # ======================== LINKEDIN ========================
-def osint_linkedin_smart(company: str, domain: str, target_role: str,
-                          serper_key: str, deepseek_key: str, best_contact_role: str) -> Dict:
+def osint_linkedin_smart(company: str, domain: str, target_role: str, serper_key: str, deepseek_key: str, best_contact_role: str) -> Dict:
     base_name = domain.split(".")[0].replace("-", " ").title()
-    roles_to_search = [
-        target_role, "CEO OR Founder OR Managing Director",
-        "CMO OR Chief Marketing Officer", "CTO OR Chief Technology Officer",
-        "Sales Director OR Head of Sales", "VP of Sales"
-    ]
+    roles_to_search = [target_role, "CEO OR Founder OR Managing Director", "CMO OR Chief Marketing Officer", "CTO OR Chief Technology Officer", "Sales Director OR Head of Sales", "VP of Sales"]
     seen_links, contacts = set(), []
     for role in roles_to_search:
         if len(contacts) >= 10:
             break
-        items = _serper_one(
-            f'site:linkedin.com/in/ "{role}" "{company or base_name}"',
-            serper_key, num=5
-        )
+        items = _serper_one(f'site:linkedin.com/in/ "{role}" "{company or base_name}"', serper_key, num=5)
         for item in items:
             title = item.get("title", "")
             link = item.get("link", "")
@@ -1073,9 +997,7 @@ def osint_linkedin_smart(company: str, domain: str, target_role: str,
                 continue
             name_raw = re.split(r"\s[-–|]\s", title)[0].strip()
             words = name_raw.split()
-            if not (2 <= len(words) <= 4 and
-                    not re.search(r"\d|@|http", name_raw) and
-                    4 <= len(name_raw) <= 40):
+            if not (2 <= len(words) <= 4 and not re.search(r"\d|@|http", name_raw) and 4 <= len(name_raw) <= 40):
                 continue
             role_extracted = title.replace(name_raw, "").strip(" -–|").strip() or role
             seen_links.add(link)
@@ -1083,13 +1005,9 @@ def osint_linkedin_smart(company: str, domain: str, target_role: str,
         time.sleep(0.3)
     if not contacts:
         return {"primary": {"name": "N/A", "linkedin": "N/A", "role": "N/A"}, "all": []}
-    system = ('You are a sales assistant. Choose the best contact for selling B2B enterprise solutions. '
-              'Return JSON: {"selected_index": 0}')
+    system = "You are a sales assistant. Choose the best contact for selling B2B enterprise solutions. Return JSON: {\"selected_index\": 0}"
     contacts_str = "\n".join([f"{i}: {c['name']} - {c['role']}" for i, c in enumerate(contacts)])
-    result = deepseek_call(
-        f"Target role preference: {best_contact_role}\nContacts:\n{contacts_str}",
-        system, deepseek_key, json_mode=True, max_tokens=200
-    )
+    result = deepseek_call(f"Target role preference: {best_contact_role}\nContacts:\n{contacts_str}", system, deepseek_key, json_mode=True, max_tokens=200)
     if isinstance(result, dict) and "selected_index" in result:
         idx = result["selected_index"]
         primary = contacts[idx] if 0 <= idx < len(contacts) else contacts[0]
@@ -1106,11 +1024,7 @@ def verify_email_millionverifier(email: str, api_key: str) -> str:
     if not api_key or not email or email == "N/A":
         return "SKIPPED"
     try:
-        r = requests.get(
-            "https://api.millionverifier.com/api/v3/",
-            params={"api": api_key, "email": email, "timeout": 10},
-            timeout=20
-        )
+        r = requests.get("https://api.millionverifier.com/api/v3/", params={"api": api_key, "email": email, "timeout": 10}, timeout=20)
         if r.status_code != 200:
             return "MV_ERROR"
         data = r.json()
@@ -1128,19 +1042,14 @@ def verify_email_millionverifier(email: str, api_key: str) -> str:
         return "MV_ERROR"
 
 def is_email_deliverable(status: str) -> bool:
-    return status in ("VALID", "RISKY", "MV_VALID", "MV_CATCH_ALL", "MV_OK",
-                      "PROSPEO", "HUNTER", "ACCEPT_ALL")
+    return status in ("VALID", "RISKY", "MV_VALID", "MV_CATCH_ALL", "MV_OK", "PROSPEO", "HUNTER", "ACCEPT_ALL")
 
 # ======================== EMAIL DISCOVERY ========================
 def _email_patterns(first: str, last: str, domain: str) -> list:
     f, l = first.lower().strip(), last.lower().strip()
     if not f or not l:
         return [f"contact@{domain}", f"info@{domain}"]
-    return [
-        f"{f}.{l}@{domain}", f"{f}{l}@{domain}", f"{f[0]}{l}@{domain}",
-        f"{f}.{l[0]}@{domain}", f"{f[0]}.{l}@{domain}", f"{f}@{domain}",
-        f"contact@{domain}", f"info@{domain}"
-    ]
+    return [f"{f}.{l}@{domain}", f"{f}{l}@{domain}", f"{f[0]}{l}@{domain}", f"{f}.{l[0]}@{domain}", f"{f[0]}.{l}@{domain}", f"{f}@{domain}", f"contact@{domain}", f"info@{domain}"]
 
 def _get_mx(domain: str) -> Optional[str]:
     try:
@@ -1150,8 +1059,7 @@ def _get_mx(domain: str) -> Optional[str]:
     except Exception:
         return None
 
-_BIG_MAIL = ["google.com", "outlook.com", "microsoft.com", "yahoo.com",
-             "protection.outlook.com", "amazonses.com"]
+_BIG_MAIL = ["google.com", "outlook.com", "microsoft.com", "yahoo.com", "protection.outlook.com", "amazonses.com"]
 
 def smtp_verify(email: str) -> str:
     domain = email.split("@")[-1]
@@ -1174,12 +1082,7 @@ def find_email_prospeo(first: str, last: str, domain: str, key: str) -> Optional
     if not key or first == "N/A":
         return None
     try:
-        r = requests.post(
-            "https://api.prospeo.io/email-finder",
-            headers={"X-KEY": key},
-            json={"first_name": first, "last_name": last, "domain": domain},
-            timeout=15
-        )
+        r = requests.post("https://api.prospeo.io/email-finder", headers={"X-KEY": key}, json={"first_name": first, "last_name": last, "domain": domain}, timeout=15)
         if r.status_code == 200:
             res = r.json().get("response", {})
             if res.get("email_status") in ("VALID", "ACCEPT_ALL"):
@@ -1192,11 +1095,7 @@ def find_email_hunter(first: str, last: str, domain: str, key: str) -> Optional[
     if not key or first == "N/A":
         return None
     try:
-        r = requests.get(
-            "https://api.hunter.io/v2/email-finder",
-            params={"domain": domain, "first_name": first, "last_name": last, "api_key": key},
-            timeout=15
-        )
+        r = requests.get("https://api.hunter.io/v2/email-finder", params={"domain": domain, "first_name": first, "last_name": last, "api_key": key}, timeout=15)
         if r.status_code == 200:
             d = r.json().get("data", {})
             if d.get("email") and int(d.get("confidence", 0)) > 50:
@@ -1234,34 +1133,28 @@ async def process_one(target: dict, sem: asyncio.Semaphore, cfg: dict, browser):
                 _buf_log(f"⏭ {domain} score={score} — below threshold", "skip")
                 return
 
-            company     = qual.get("company_name", domain)
+            company = qual.get("company_name", domain)
             revenue_range = qual.get("revenue_range", "")
-            headquarters  = qual.get("headquarters", "")
-            icebreaker    = qual.get("icebreaker", "")
-            pain_points   = qual.get("pain_points", "")
-            ready_email   = qual.get("ready_email", "")
-            tech_gap      = qual.get("tech_gap", "")
+            headquarters = qual.get("headquarters", "")
+            icebreaker = qual.get("icebreaker", "")
+            pain_points = qual.get("pain_points", "")
+            ready_email = qual.get("ready_email", "")
+            tech_gap = qual.get("tech_gap", "")
+            email_sequence = ready_email or f"Email 1: {icebreaker}\nEmail 2: {pain_points}\nEmail 3: Let's schedule a call."
 
-            email_sequence = ready_email or (
-                f"Email 1: {icebreaker}\nEmail 2: {pain_points}\nEmail 3: Let's schedule a call."
-            )
-
-            intent       = await get_intent_hiring(company, domain, cfg["serper_key"])
+            intent = await get_intent_hiring(company, domain, cfg["serper_key"])
             social_proof = await get_social_proof(company, domain, cfg["serper_key"])
-            dmu          = await find_dmu(company, domain, cfg["serper_key"])
-            li_data      = await asyncio.to_thread(
-                osint_linkedin_smart, company, domain, cfg["target_role"],
-                cfg["serper_key"], cfg["deepseek_key"], cfg.get("best_contact_role", "CEO")
-            )
-            primary    = li_data["primary"]
-            person     = primary["name"]
-            linkedin   = primary["linkedin"]
+            dmu = await find_dmu(company, domain, cfg["serper_key"])
+            li_data = await asyncio.to_thread(osint_linkedin_smart, company, domain, cfg["target_role"], cfg["serper_key"], cfg["deepseek_key"], cfg.get("best_contact_role", "CEO"))
+            primary = li_data["primary"]
+            person = primary["name"]
+            linkedin = primary["linkedin"]
             role_found = primary["role"] if primary["role"] != "N/A" else cfg["target_role"]
 
             email, email_status = "N/A", "UNKNOWN"
             parts = person.split() if person != "N/A" else []
             first = parts[0] if parts else "N/A"
-            last  = parts[-1] if len(parts) >= 2 else "N/A"
+            last = parts[-1] if len(parts) >= 2 else "N/A"
 
             if emails:
                 email = emails[0]
@@ -1280,9 +1173,7 @@ async def process_one(target: dict, sem: asyncio.Semaphore, cfg: dict, browser):
                     email, email_status = found, st_val
             if email != "N/A" and cfg.get("millionverifier_key"):
                 mv = await asyncio.to_thread(verify_email_millionverifier, email, cfg["millionverifier_key"])
-                _buf_log(f"📧 MV [{email}]: {mv}", "info")
                 if mv in ("MV_INVALID", "MV_DISPOSABLE"):
-                    _buf_log(f"🚫 MV відхилив {email} ({mv})", "warn")
                     email, email_status = "N/A", mv
                 else:
                     email_status = mv
@@ -1300,18 +1191,13 @@ async def process_one(target: dict, sem: asyncio.Semaphore, cfg: dict, browser):
                 "phone": qual.get("direct_phone", ""), "score": score, "tier": tier,
                 "tech_stack": qual.get("tech_stack", ""), "employees": qual.get("employees", "unknown"),
                 "revenue_sig": revenue_range, "country": country,
-                "industry": qual.get("industry", ""), "url": url,
-                "source_query": cfg.get("query", ""),
-                "funding": qual.get("funding", ""),
-                "key_customers": qual.get("key_customers", ""),
-                "competitors": qual.get("competitors", ""),
-                "intent_hiring": json.dumps(intent), "social_proof": social_proof,
-                "ready_email": ready_email, "email_sequence": email_sequence,
+                "industry": qual.get("industry", ""), "url": url, "source_query": cfg.get("query",""),
+                "funding": qual.get("funding", ""), "key_customers": qual.get("key_customers", ""),
+                "competitors": qual.get("competitors", ""), "intent_hiring": json.dumps(intent),
+                "social_proof": social_proof, "ready_email": ready_email, "email_sequence": email_sequence,
                 "icebreaker": icebreaker, "pain_points": pain_points, "tech_gap": tech_gap,
-                "dmu_champion": dmu.get("champion", ""),
-                "dmu_economic": dmu.get("economic", ""),
-                "dmu_gatekeeper": dmu.get("gatekeeper", ""),
-                "campaign_id": campaign_id,
+                "dmu_champion": dmu.get("champion",""), "dmu_economic": dmu.get("economic",""),
+                "dmu_gatekeeper": dmu.get("gatekeeper",""), "campaign_id": campaign_id,
             }
             db_save_lead(row)
             with _results_lock:
@@ -1323,10 +1209,7 @@ async def process_one(target: dict, sem: asyncio.Semaphore, cfg: dict, browser):
                 _inc_stat("whales")
             if email != "N/A":
                 _inc_stat("emails")
-            _buf_log(
-                f"{tier} [{score}] {domain} | {person} | {email} [{email_status}] | 💰 {revenue_range}",
-                "diamond" if "💎" in tier else "whale"
-            )
+            _buf_log(f"{tier} [{score}] {domain} | {person} | {email} [{email_status}] | 💰 {revenue_range}", "diamond" if "💎" in tier else "whale")
         except Exception as e:
             _buf_log(f"❌ {domain}: {str(e)[:100]}", "error")
 
@@ -1338,8 +1221,7 @@ async def run_campaign(campaign: Dict, cfg: Dict):
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
         c.execute("UPDATE campaigns SET status='running' WHERE id=?", (campaign_id,))
-        c.execute("UPDATE queue SET status='running', started_at=? WHERE campaign_id=?",
-                  (datetime.now(), campaign_id))
+        c.execute("UPDATE queue SET status='running', started_at=? WHERE campaign_id=?", (datetime.now(), campaign_id))
         conn.commit()
     total_collected = campaign["collected_leads"]
     while total_collected < target:
@@ -1354,10 +1236,7 @@ async def run_campaign(campaign: Dict, cfg: Dict):
             break
         sem = asyncio.Semaphore(cfg["threads"])
         async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-images"]
-            )
+            browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-images"])
             cfg["campaign_id"] = campaign_id
             await asyncio.gather(*[process_one(t, sem, cfg, browser) for t in targets])
             await browser.close()
@@ -1391,19 +1270,16 @@ async def enrich_one_domain(domain: str, cfg: dict, browser) -> dict:
         data = await deep_scrape(url, browser, cfg["scrape_depth"], proxy=cfg.get("proxy"))
         qual = await asyncio.to_thread(ai_qualify_elite, data["text"], domain, cfg["deepseek_key"])
         company = qual.get("company_name", domain)
-        li_data = await asyncio.to_thread(
-            osint_linkedin_smart, company, domain, cfg["target_role"],
-            cfg["serper_key"], cfg["deepseek_key"], cfg.get("best_contact_role", "CEO")
-        )
-        primary    = li_data["primary"]
-        person     = primary["name"]
-        linkedin   = primary["linkedin"]
+        li_data = await asyncio.to_thread(osint_linkedin_smart, company, domain, cfg["target_role"], cfg["serper_key"], cfg["deepseek_key"], cfg.get("best_contact_role", "CEO"))
+        primary = li_data["primary"]
+        person = primary["name"]
+        linkedin = primary["linkedin"]
         role_found = primary["role"] if primary["role"] != "N/A" else cfg["target_role"]
 
         email, email_status = "N/A", "UNKNOWN"
         parts = person.split() if person != "N/A" else []
         first = parts[0] if parts else "N/A"
-        last  = parts[-1] if len(parts) >= 2 else "N/A"
+        last = parts[-1] if len(parts) >= 2 else "N/A"
 
         if data["emails"]:
             email = data["emails"][0]
@@ -1456,11 +1332,7 @@ async def enrich_one_domain(domain: str, cfg: dict, browser) -> dict:
 # ════════════════════════════════════════════════
 #  UI — STREAMLIT
 # ════════════════════════════════════════════════
-st.set_page_config(
-    page_title="TITAN v5.0",
-    layout="wide",
-    page_icon="🔱"
-)
+st.set_page_config(page_title="TITAN v5.0", layout="wide", page_icon="🔱")
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Orbitron:wght@400;700;900&display=swap');
@@ -1483,21 +1355,20 @@ div[data-testid="stMetricLabel"] { font-size:0.8rem; text-transform:uppercase; l
 require_auth()
 # ════════════════════════════════════════════════
 
-st.markdown('<div class="titan-title">🔱 TITAN v5.0 — CAMPAIGN MANAGER + ENRICHMENT</div>',
-            unsafe_allow_html=True)
+st.markdown('<div class="titan-title">🔱 TITAN v5.0 — CAMPAIGN MANAGER + ENRICHMENT</div>', unsafe_allow_html=True)
 st.caption("Secured Edition — Telegram PIN Auth enabled")
 
 # ======================== SIDEBAR ========================
 with st.sidebar:
     st.markdown("### 🔑 API KEYS")
-    deepseek_key         = st.text_input("DeepSeek API Key ★", type="password")
-    serper_key           = st.text_input("Serper API Key ★", type="password")
-    prospeo_key          = st.text_input("Prospeo (optional)", type="password")
-    hunter_key           = st.text_input("Hunter.io (optional)", type="password")
+    deepseek_key = st.text_input("DeepSeek API Key ★", type="password")
+    serper_key = st.text_input("Serper API Key ★", type="password")
+    prospeo_key = st.text_input("Prospeo (optional)", type="password")
+    hunter_key = st.text_input("Hunter.io (optional)", type="password")
 
     st.markdown('<div class="sec-hdr">📧 EMAIL VERIFICATION</div>', unsafe_allow_html=True)
-    use_millionverifier  = st.checkbox("Use MillionVerifier", value=True)
-    millionverifier_key  = st.text_input("MillionVerifier API Key", type="password")
+    use_millionverifier = st.checkbox("Use MillionVerifier", value=True)
+    millionverifier_key = st.text_input("MillionVerifier API Key", type="password")
     if use_millionverifier and millionverifier_key:
         if st.button("🧪 Test MillionVerifier"):
             res = verify_email_millionverifier("test@gmail.com", millionverifier_key)
@@ -1516,7 +1387,6 @@ with st.sidebar:
         st.session_state.auth_pin_sent = False
         st.rerun()
 
-    # Адмін-панель: активні сесії та бани
     with st.expander("🛡️ Security Admin"):
         with _AUTH_LOCK:
             n_sess = len(_active_sessions)
@@ -1530,70 +1400,59 @@ with st.sidebar:
             st.success("Всі бани знято")
         try:
             with sqlite3.connect(DB_PATH) as conn:
-                log_df = pd.read_sql_query(
-                    "SELECT ip,event,ts FROM access_log ORDER BY ts DESC LIMIT 20", conn
-                )
+                log_df = pd.read_sql_query("SELECT ip,event,ts FROM access_log ORDER BY ts DESC LIMIT 20", conn)
             if not log_df.empty:
                 st.dataframe(log_df, use_container_width=True)
         except Exception:
             pass
 
     st.markdown('<div class="sec-hdr">⚙️ ENGINE</div>', unsafe_allow_html=True)
-    parallel         = st.slider("Parallel workers", 1, 50, DEFAULT_PARALLEL)
-    scrape_depth     = st.slider("Scrape depth (chars)", 2000, 10000, DEFAULT_SCRAPE_DEPTH, 500)
-    min_score        = st.slider("Min score (0-100)", 0, 100, DEFAULT_MIN_SCORE)
-    only_whales      = st.checkbox("Skip low-score leads", value=True)
-    bruteforce       = st.checkbox("SMTP bruteforce (slow)", value=False)
-    use_proxy        = st.checkbox("Use proxy", value=False)
-    proxy_url        = st.text_input("Proxy URL") if use_proxy else ""
-    target_countries = st.multiselect("Target countries", list(COUNTRY_TLD.keys()),
-                                      default=["Germany", "USA", "UK", "Singapore"])
-    target_role      = st.text_input("Target role", value="CEO OR Founder OR Managing Director")
-    best_contact_role= st.text_input("Best contact role", value="CEO")
+    parallel = st.slider("Parallel workers", 1, 50, DEFAULT_PARALLEL)
+    scrape_depth = st.slider("Scrape depth (chars)", 2000, 10000, DEFAULT_SCRAPE_DEPTH, 500)
+    min_score = st.slider("Min score (0-100)", 0, 100, DEFAULT_MIN_SCORE)
+    only_whales = st.checkbox("Skip low-score leads", value=True)
+    bruteforce = st.checkbox("SMTP bruteforce (slow)", value=False)
+    use_proxy = st.checkbox("Use proxy", value=False)
+    proxy_url = st.text_input("Proxy URL") if use_proxy else ""
+    target_countries = st.multiselect("Target countries", list(COUNTRY_TLD.keys()), default=["Germany", "USA", "UK", "Singapore"])
+    target_role = st.text_input("Target role", value="CEO OR Founder OR Managing Director")
+    best_contact_role = st.text_input("Best contact role", value="CEO")
 
 # ======================== МЕТРИКИ ========================
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("🎯 Total",    st.session_state.stats.get("total", 0))
+m1.metric("🎯 Total", st.session_state.stats.get("total", 0))
 m2.metric("💎 Diamonds", st.session_state.stats.get("diamonds", 0))
-m3.metric("🐋 Whales",   st.session_state.stats.get("whales", 0))
-m4.metric("📧 Emails",   st.session_state.stats.get("emails", 0))
+m3.metric("🐋 Whales", st.session_state.stats.get("whales", 0))
+m4.metric("📧 Emails", st.session_state.stats.get("emails", 0))
 
 # ======================== LIVE LOG ========================
 st.markdown('### 📡 Телеметрія <span class="live-badge">LIVE</span>', unsafe_allow_html=True)
 log_placeholder = st.empty()
 
 def _render_logs():
-    html = "<br>".join(st.session_state.logs[:300]) if st.session_state.logs else \
-        '<span style="color:#475569">Логи з\'являться після запуску...</span>'
+    html = "<br>".join(st.session_state.logs[:300]) if st.session_state.logs else '<span style="color:#475569">Логи з\'являться після запуску...</span>'
     log_placeholder.markdown(f'<div class="log-container">{html}</div>', unsafe_allow_html=True)
 
 _render_logs()
 
 # ======================== TABS ========================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "📋 Campaigns", "➕ Create Campaign", "⏳ Queue & Run",
-    "📊 Leads", "📈 Enrichment", "📧 Email Verifier"
-])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📋 Campaigns", "➕ Create Campaign", "⏳ Queue & Run", "📊 Leads", "📈 Enrichment", "📧 Email Verifier"])
 
 with tab1:
     st.subheader("Existing Campaigns")
     df_camps = get_all_campaigns()
     if not df_camps.empty:
-        st.dataframe(
-            df_camps[["id","name","theme_query","target_leads","collected_leads",
-                       "status","client_id","created_at"]],
-            use_container_width=True
-        )
+        st.dataframe(df_camps[["id","name","theme_query","target_leads","collected_leads","status","client_id","created_at"]], use_container_width=True)
     else:
         st.info("No campaigns yet.")
 
 with tab2:
     st.subheader("Create New Campaign")
     with st.form("create_campaign_form"):
-        name         = st.text_input("Campaign Name")
-        theme_query  = st.text_area("Theme / Query", height=80)
+        name = st.text_input("Campaign Name")
+        theme_query = st.text_area("Theme / Query", height=80)
         target_leads = st.number_input("Target leads", min_value=1, max_value=10000, value=50)
-        client_id    = st.text_input("Client ID", placeholder="client_123")
+        client_id = st.text_input("Client ID", placeholder="client_123")
         if st.form_submit_button("Create Campaign"):
             if not name or not theme_query or not client_id:
                 st.error("Name, query and client ID are required")
@@ -1607,10 +1466,7 @@ with tab3:
     st.subheader("Queue Management")
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("""
-            SELECT q.id, c.name, c.target_leads, c.collected_leads, q.status
-            FROM queue q JOIN campaigns c ON q.campaign_id = c.id ORDER BY q.id
-        """)
+        c.execute("SELECT q.id, c.name, c.target_leads, c.collected_leads, q.status FROM queue q JOIN campaigns c ON q.campaign_id = c.id ORDER BY q.id")
         queue_items = c.fetchall()
     if queue_items:
         for qi in queue_items:
@@ -1620,11 +1476,7 @@ with tab3:
     camp_options = get_all_campaigns()
     camp_options = camp_options[camp_options["status"] == "pending"]
     if not camp_options.empty:
-        selected_camp = st.selectbox(
-            "Select campaign to add to queue",
-            camp_options["id"].tolist(),
-            format_func=lambda x: f"{x}: {camp_options[camp_options['id']==x]['name'].iloc[0]}"
-        )
+        selected_camp = st.selectbox("Select campaign to add to queue", camp_options["id"].tolist(), format_func=lambda x: f"{x}: {camp_options[camp_options['id']==x]['name'].iloc[0]}")
         if st.button("Add to Queue"):
             add_to_queue(selected_camp)
             st.success(f"Campaign {selected_camp} added to queue")
@@ -1642,27 +1494,17 @@ with tab4:
     st.subheader("Leads per Campaign")
     all_camps = get_all_campaigns()
     if not all_camps.empty:
-        selected_camp_id = st.selectbox(
-            "Select Campaign",
-            all_camps["id"].tolist(),
-            format_func=lambda x: f"{x}: {all_camps[all_camps['id']==x]['name'].iloc[0]}"
-        )
+        selected_camp_id = st.selectbox("Select Campaign", all_camps["id"].tolist(), format_func=lambda x: f"{x}: {all_camps[all_camps['id']==x]['name'].iloc[0]}")
         if selected_camp_id:
             leads_df = get_campaign_leads(selected_camp_id)
             if not leads_df.empty:
-                st.dataframe(
-                    leads_df[["domain","company","person","role","email","email_status",
-                               "score","tier","country","icebreaker","tech_gap"]],
-                    use_container_width=True
-                )
+                st.dataframe(leads_df[["domain","company","person","role","email","email_status","score","tier","country","icebreaker","tech_gap"]], use_container_width=True)
                 col1, col2 = st.columns(2)
                 with col1:
                     csv = leads_df.to_csv(index=False).encode("utf-8")
-                    st.download_button("📥 Download CSV", csv,
-                                       f"campaign_{selected_camp_id}_leads.csv", "text/csv")
+                    st.download_button("📥 Download CSV", csv, f"campaign_{selected_camp_id}_leads.csv", "text/csv")
                 with col2:
-                    user_id = st.text_input("Target User ID", value="69d0df35532e93c9697f66ea",
-                                            key="api_user_id")
+                    user_id = st.text_input("Target User ID", value="69d0df35532e93c9697f66ea", key="api_user_id")
                     if st.button("📤 Send to API"):
                         send_df = leads_df.copy()
                         send_df["name"] = send_df["person"]
@@ -1700,7 +1542,7 @@ with tab5:
                     else:
                         domains = df["domain"].dropna().unique().tolist()
                         enrich_progress = st.progress(0, text=f"0/{len(domains)} done")
-                        enrich_status   = st.empty()
+                        enrich_status = st.empty()
                         enrich_status.info(f"Знайдено {len(domains)} доменів...")
                         cfg_enrich = {
                             "deepseek_key": deepseek_key, "serper_key": serper_key,
@@ -1716,11 +1558,7 @@ with tab5:
                         async def run_enrichment():
                             sem = asyncio.Semaphore(parallel)
                             async with async_playwright() as pw:
-                                browser = await pw.chromium.launch(
-                                    headless=True,
-                                    args=["--no-sandbox","--disable-dev-shm-usage",
-                                          "--disable-gpu","--disable-images"]
-                                )
+                                browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-images"])
                                 async def _track(d):
                                     r = await enrich_one_domain(d, cfg_enrich, browser)
                                     done_count[0] += 1
@@ -1750,9 +1588,7 @@ with tab5:
                         merged = df.merge(pd.DataFrame(result_holder), on="domain", how="left")
                         st.session_state.enrichment_df = merged
                         st.dataframe(merged.head(10))
-                        st.download_button("📥 Download Enriched CSV",
-                                           merged.to_csv(index=False).encode("utf-8"),
-                                           "enriched_leads.csv", "text/csv")
+                        st.download_button("📥 Download Enriched CSV", merged.to_csv(index=False).encode("utf-8"), "enriched_leads.csv", "text/csv")
         except Exception as e:
             st.error(f"Error: {e}")
 
@@ -1760,13 +1596,10 @@ with tab6:
     st.subheader("📧 MillionVerifier — Масова перевірка")
     mv_col1, mv_col2 = st.columns(2)
     with mv_col1:
-        mv_emails_raw = st.text_area("Email-адреси (по одній на рядок)", height=200,
-                                     placeholder="john@example.com\ninfo@company.de")
+        mv_emails_raw = st.text_area("Email-адреси (по одній на рядок)", height=200, placeholder="john@example.com\ninfo@company.de")
     with mv_col2:
         mv_csv_file = st.file_uploader("Або CSV з колонкою email", type=["csv"], key="mv_csv")
-    mv_key_override = st.text_input("MillionVerifier API Key",
-                                    value=millionverifier_key if use_millionverifier else "",
-                                    type="password", key="mv_key_tab")
+    mv_key_override = st.text_input("MillionVerifier API Key", value=millionverifier_key if use_millionverifier else "", type="password", key="mv_key_tab")
     if st.button("🔍 Перевірити emails", type="primary"):
         emails_to_check = []
         if mv_emails_raw.strip():
@@ -1786,10 +1619,7 @@ with tab6:
             total_mv = len(emails_to_check)
             for i, em in enumerate(emails_to_check):
                 status = verify_email_millionverifier(em, mv_key_override)
-                mv_results.append({
-                    "email": em, "mv_status": status,
-                    "deliverable": "✅" if is_email_deliverable(status) else "❌"
-                })
+                mv_results.append({"email": em, "mv_status": status, "deliverable": "✅" if is_email_deliverable(status) else "❌"})
                 _buf_log(f"📧 MV {em}: {status}", "info")
                 _sync_to_session()
                 _render_logs()
@@ -1804,8 +1634,7 @@ with tab6:
             c2.metric("❌ Invalid", mv_df_result[mv_df_result["deliverable"]=="❌"].shape[0])
             c3.metric("❓ Unknown", mv_df_result[mv_df_result["mv_status"].str.contains("UNKNOWN|CATCH", na=False)].shape[0])
             st.dataframe(mv_df_result, use_container_width=True)
-            st.download_button("📥 Завантажити", mv_df_result.to_csv(index=False).encode("utf-8"),
-                               "mv_results.csv", "text/csv")
+            st.download_button("📥 Завантажити", mv_df_result.to_csv(index=False).encode("utf-8"), "mv_results.csv", "text/csv")
 
 # ======================== CAMPAIGN PROGRESS ========================
 prog_ph = st.empty()
@@ -1816,13 +1645,11 @@ def _redraw_ui():
     if st.session_state.active_campaign_id:
         with sqlite3.connect(DB_PATH) as conn:
             c = conn.cursor()
-            c.execute("SELECT target_leads, collected_leads FROM campaigns WHERE id=?",
-                      (st.session_state.active_campaign_id,))
+            c.execute("SELECT target_leads, collected_leads FROM campaigns WHERE id=?", (st.session_state.active_campaign_id,))
             row = c.fetchone()
             if row:
                 t, cl = row
-                prog_ph.progress(min(1.0, cl/t) if t > 0 else 0.0,
-                                 text=f"Campaign: {cl}/{t} leads")
+                prog_ph.progress(min(1.0, cl/t) if t > 0 else 0.0, text=f"Campaign: {cl}/{t} leads")
     else:
         prog_ph.empty()
 
