@@ -4,11 +4,13 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║  TITAN v5.0 ULTRA — Secured Edition                                         ║
 ║  + Telegram PIN Auth (кожен вхід → PIN у Telegram)                          ║
-║  + Session management + IP blocking + Rate limiting                         ║
+║  + MillionVerifier email validation                                         ║
+║  + Advanced blocklists (investor pages, market reports, etc.)               ║
+║  + Enrichment of existing CSV bases                                         ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
-# ======================== ІМПОРТИ (без дублів) ========================
+# ======================== ІМПОРТИ ========================
 import sys
 import os
 import hashlib
@@ -39,11 +41,12 @@ import dns.resolver
 import pandas as pd
 import nest_asyncio
 import streamlit as st
-import os
-# Завантажуємо браузер для Playwright при запуску на Streamlit Cloud
+
+# Встановлення Playwright (якщо не встановлено) – для Streamlit Cloud
 if not os.path.exists("/home/appuser/.cache/ms-playwright"):
     os.system("playwright install chromium")
     os.system("playwright install-deps")
+
 from playwright.async_api import async_playwright
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -52,11 +55,11 @@ nest_asyncio.apply()
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# ════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 #  КОНФІГУРАЦІЯ — ЗАПОВНІТЬ ПЕРЕД ДЕПЛОЄМ
-# ════════════════════════════════════════════════════
-TELEGRAM_BOT_TOKEN = os.environ.get("7834347258:AAGXPDoyemyNvfOqoZBeEB_5PFYNB7aRrDw", "YOUR_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = os.environ.get("1913057855",   "YOUR_CHAT_ID")
+# ═══════════════════════════════════════════════════════════════════════════════
+TELEGRAM_BOT_TOKEN = "7834347258:AAGXPDoyemyNvfOqoZBeEB_5PFYNB7aRrDw"
+TELEGRAM_CHAT_ID   = "1913057855"
 
 # Час дії PIN (секунди)
 PIN_TTL_SECONDS  = 60   # 1 хвилина
@@ -67,9 +70,9 @@ IP_BAN_SECONDS   = 3600   # 60 хвилин
 # Сесія дійсна N хвилин після входу
 SESSION_TTL_MIN  = 240   # 2 години
 
-# ════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 #  ЗБЕРІГАННЯ СЕСІЙ / ПІНІВ / БАНІВ (в пам'яті + файл)
-# ════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 _AUTH_LOCK = threading.Lock()
 
 # { ip: {"pin": "...", "expires": datetime, "tries": int} }
@@ -100,6 +103,7 @@ def _tg_send(text: str) -> bool:
 def _get_client_ip() -> str:
     """Витягує IP клієнта з Streamlit headers."""
     try:
+        # Для Streamlit Cloud / локального сервера
         headers = st.context.headers
         # За проксі (Nginx / Cloudflare)
         for h in ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP"):
@@ -752,7 +756,7 @@ Return JSON: {{"queries": [...]}}"""
             out.append(d)
     return out[:40]
 
-# ======================== BLOCK LISTS ========================
+# ======================== РОЗШИРЕНІ БЛОК-ЛИСТИ ========================
 _BLOCK_DOMAINS = {
     "linkedin.com", "facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com",
     "wikipedia.org", "crunchbase.com", "indeed.com", "glassdoor.com", "reddit.com", "quora.com",
