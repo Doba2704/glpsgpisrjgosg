@@ -1,0 +1,8 @@
+streamlit
+playwright
+tenacity
+nest-asyncio
+dnspython
+requests
+pandas
+cryptography
