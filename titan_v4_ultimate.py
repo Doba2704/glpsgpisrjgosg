@@ -1,36 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  TITAN v5.0 ULTRA — Secured Edition (PIN fix via session_state)            ║
-║  + Telegram PIN Auth (зберігання PIN у st.session_state)                    ║
-║  + MillionVerifier email validation                                         ║
-║  + Advanced blocklists (investor pages, market reports, etc.)               ║
-║  + Enrichment of existing CSV bases                                         ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+TITAN v5.0 ULTRA — Secured Edition (FULLY FIXED AUTH)
 """
 
-# ======================== ІМПОРТИ ========================
 import sys
 import os
-import hashlib
 import time
 import threading
-import ctypes
-import shutil
-import subprocess
-import json
-import getpass
-import platform
-import uuid
+import secrets
 import re
 import asyncio
 import sqlite3
 import smtplib
 import random
-import io
-import secrets
-import traceback
+import json
 from collections import deque, defaultdict
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
@@ -41,67 +25,40 @@ import dns.resolver
 import pandas as pd
 import nest_asyncio
 import streamlit as st
-
-# Встановлення Playwright (якщо не встановлено) – для Streamlit Cloud
-if not os.path.exists("/home/appuser/.cache/ms-playwright"):
-    os.system("playwright install chromium")
-    os.system("playwright install-deps")
-
 from playwright.async_api import async_playwright
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 nest_asyncio.apply()
-
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  КОНФІГУРАЦІЯ — Telegram (вже заповнена)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ======================== КОНФІГУРАЦІЯ TELEGRAM ========================
 TELEGRAM_BOT_TOKEN = "7834347258:AAGXPDoyemyNvfOqoZBeEB_5PFYNB7aRrDw"
 TELEGRAM_CHAT_ID   = "1913057855"
 
-# Час дії PIN (секунди)
-PIN_TTL_SECONDS  = 60   # 1 хвилина
-# Максимум невдалих спроб перед блокуванням IP
+PIN_TTL_SECONDS  = 60
 MAX_FAILED_TRIES = 3
-# Час блокування IP (секунди)
-IP_BAN_SECONDS   = 3600   # 60 хвилин
-# Сесія дійсна N хвилин після входу
-SESSION_TTL_MIN  = 240   # 2 години
+IP_BAN_SECONDS   = 3600
+SESSION_TTL_MIN  = 240
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  ЗБЕРІГАННЯ СЕСІЙ / ПІНІВ / БАНІВ (в пам'яті + session_state)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ======================== СТАН АВТОРИЗАЦІЇ ========================
 _AUTH_LOCK = threading.Lock()
-
-# { ip: {"pin": "...", "expires": datetime, "tries": int} }
 _pending_pins: Dict[str, dict] = {}
-# { ip: datetime }  — коли закінчується бан
 _banned_ips: Dict[str, datetime] = {}
-# { session_token: {"ip": ..., "expires": datetime} }
 _active_sessions: Dict[str, dict] = {}
-# { ip: int }  — лічильник невдалих спроб
 _fail_count: Dict[str, int] = defaultdict(int)
 
-# ─────────── Telegram helpers ───────────────────────────────
 def _tg_send(text: str) -> bool:
-    """Відправляє повідомлення в Telegram."""
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_BOT_TOKEN":
+    if not TELEGRAM_BOT_TOKEN:
         return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }, timeout=10)
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=10)
         return r.status_code == 200
     except Exception:
         return False
 
 def _get_client_ip() -> str:
-    """Витягує IP клієнта з Streamlit headers."""
     try:
         headers = st.context.headers
         for h in ("X-Forwarded-For", "X-Real-IP", "CF-Connecting-IP"):
@@ -113,10 +70,8 @@ def _get_client_ip() -> str:
     return "unknown"
 
 def _geo_lookup(ip: str) -> str:
-    """Швидкий гео-пошук через ip-api."""
     try:
-        r = requests.get(f"http://ip-api.com/json/{ip}?fields=country,city,isp",
-                         timeout=5)
+        r = requests.get(f"http://ip-api.com/json/{ip}?fields=country,city,isp", timeout=5)
         if r.status_code == 200:
             d = r.json()
             return f"{d.get('city','?')}, {d.get('country','?')} | {d.get('isp','?')}"
@@ -124,70 +79,41 @@ def _geo_lookup(ip: str) -> str:
         pass
     return "geo unknown"
 
-# ─────────── PIN генерація і верифікація (з session_state) ───────────
 def generate_and_send_pin(ip: str) -> bool:
-    """Генерує PIN, зберігає в пам'яті та в st.session_state, відправляє в Telegram."""
     pin = str(secrets.randbelow(900000) + 100000)
     expires = datetime.now() + timedelta(seconds=PIN_TTL_SECONDS)
     geo = _geo_lookup(ip)
-    
-    # Зберігаємо в глобальному словнику (для сумісності)
     with _AUTH_LOCK:
         _pending_pins[ip] = {"pin": pin, "expires": expires}
-    
-    # Також зберігаємо в st.session_state (для надійності між rerun)
     st.session_state.temp_pin = pin
     st.session_state.temp_pin_expires = expires
-    
-    msg = (
-        f"🔐 <b>TITAN — Новий вхід</b>\n\n"
-        f"🌐 IP: <code>{ip}</code>\n"
-        f"📍 Гео: {geo}\n"
-        f"🕐 Час: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        f"🔑 PIN-код: <b><code>{pin}</code></b>\n"
-        f"⏳ Дійсний {PIN_TTL_SECONDS // 60} хв\n\n"
-        f"Якщо це не ви — заблокуйте IP!"
-    )
+    msg = (f"🔐 <b>TITAN — Новий вхід</b>\n\n🌐 IP: <code>{ip}</code>\n📍 Гео: {geo}\n🕐 Час: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n🔑 PIN-код: <b><code>{pin}</code></b>\n⏳ Дійсний {PIN_TTL_SECONDS // 60} хв")
     return _tg_send(msg)
 
 def verify_pin(ip: str, entered: str) -> Tuple[bool, str]:
-    """
-    Перевіряє PIN. Спочатку перевіряє в st.session_state, потім у глобальному словнику.
-    """
-    # Перевіряємо бан
     with _AUTH_LOCK:
         ban_until = _banned_ips.get(ip)
     if ban_until and datetime.now() < ban_until:
         remaining = int((ban_until - datetime.now()).total_seconds())
         return False, f"IP заблоковано ще на {remaining} сек"
-    
     expected_pin = None
     expires = None
-    
-    # Спершу з session_state
     if st.session_state.temp_pin and st.session_state.temp_pin_expires:
         expected_pin = st.session_state.temp_pin
         expires = st.session_state.temp_pin_expires
-    
-    # Якщо немає в session_state, то з глобального словника
     if not expected_pin:
         with _AUTH_LOCK:
             data = _pending_pins.get(ip)
             if data:
                 expected_pin = data["pin"]
                 expires = data["expires"]
-    
     if not expected_pin:
         return False, "PIN не знайдено — запросіть новий"
-    
     if datetime.now() > expires:
-        # Очищаємо прострочений PIN
         with _AUTH_LOCK:
             _pending_pins.pop(ip, None)
         st.session_state.temp_pin = None
-        st.session_state.temp_pin_expires = None
         return False, "PIN прострочено — запросіть новий"
-    
     if entered.strip() != expected_pin:
         _fail_count[ip] += 1
         if _fail_count[ip] >= MAX_FAILED_TRIES:
@@ -196,26 +122,17 @@ def verify_pin(ip: str, entered: str) -> Tuple[bool, str]:
                 _banned_ips[ip] = ban_until
                 _pending_pins.pop(ip, None)
             st.session_state.temp_pin = None
-            st.session_state.temp_pin_expires = None
-            _tg_send(
-                f"🚨 <b>TITAN — IP ЗАБЛОКОВАНО</b>\n"
-                f"IP <code>{ip}</code> зробив {MAX_FAILED_TRIES} невдалих спроб входу!\n"
-                f"Заблоковано на {IP_BAN_SECONDS // 60} хв."
-            )
+            _tg_send(f"🚨 <b>TITAN — IP ЗАБЛОКОВАНО</b>\nIP <code>{ip}</code> зробив {MAX_FAILED_TRIES} невдалих спроб!\nЗаблоковано на {IP_BAN_SECONDS // 60} хв.")
             return False, f"Забагато спроб — IP заблоковано на {IP_BAN_SECONDS // 60} хв"
         remaining = MAX_FAILED_TRIES - _fail_count[ip]
         return False, f"Невірний PIN. Залишилось спроб: {remaining}"
-    
-    # PIN вірний
     _fail_count[ip] = 0
     with _AUTH_LOCK:
         _pending_pins.pop(ip, None)
     st.session_state.temp_pin = None
-    st.session_state.temp_pin_expires = None
     return True, "OK"
 
 def create_session(ip: str) -> str:
-    """Створює токен сесії для авторизованого IP."""
     token = secrets.token_hex(32)
     expires = datetime.now() + timedelta(minutes=SESSION_TTL_MIN)
     with _AUTH_LOCK:
@@ -223,7 +140,6 @@ def create_session(ip: str) -> str:
     return token
 
 def check_session(token: str, ip: str) -> bool:
-    """Перевіряє чи сесія дійсна."""
     if not token:
         return False
     with _AUTH_LOCK:
@@ -239,7 +155,6 @@ def check_session(token: str, ip: str) -> bool:
     return True
 
 def cleanup_expired():
-    """Прибирає прострочені записи (фоновий потік)."""
     while True:
         now = datetime.now()
         with _AUTH_LOCK:
@@ -256,46 +171,35 @@ def cleanup_expired():
 
 threading.Thread(target=cleanup_expired, daemon=True).start()
 
-# ─────────── Streamlit Auth Gate ────────────────────────────
+# ======================== AUTH GATE ========================
 def render_auth_screen(ip: str):
-    """Рендерить екран авторизації через PIN."""
     st.markdown("""
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Inter:wght@400;600&display=swap');
     .stApp { background: radial-gradient(circle at 10% 20%, #0a0f1e, #030712); }
     </style>
     """, unsafe_allow_html=True)
-
     col = st.columns([1, 2, 1])[1]
     with col:
         st.markdown("""
         <div style="text-align:center;margin:60px 0 30px">
-            <div style="font-family:Orbitron,sans-serif;font-size:2rem;font-weight:900;
-                        background:linear-gradient(90deg,#e879f9,#60a5fa,#34d399);
-                        -webkit-background-clip:text;-webkit-text-fill-color:transparent">
+            <div style="font-family:monospace;font-size:2rem;font-weight:900;background:linear-gradient(90deg,#e879f9,#60a5fa,#34d399);-webkit-background-clip:text;-webkit-text-fill-color:transparent">
                 🔱 TITAN v5.0
             </div>
-            <div style="color:#94a3b8;margin-top:8px;font-size:0.9rem">
-                Захищений доступ — потрібна авторизація
-            </div>
+            <div style="color:#94a3b8">Захищений доступ — потрібна авторизація</div>
         </div>
         """, unsafe_allow_html=True)
-
         if "auth_pin_sent" not in st.session_state:
             st.session_state.auth_pin_sent = False
         if "auth_session" not in st.session_state:
             st.session_state.auth_session = ""
-
         with _AUTH_LOCK:
             ban = _banned_ips.get(ip)
         if ban and datetime.now() < ban:
             remaining = int((ban - datetime.now()).total_seconds())
-            st.error(f"🚫 Ваш IP заблоковано на {remaining} сек через підозрілу активність")
+            st.error(f"🚫 Ваш IP заблоковано на {remaining} сек")
             st.stop()
-
         if not st.session_state.auth_pin_sent:
             st.info(f"🌐 Ваш IP: `{ip}`")
-            st.markdown("Натисніть кнопку — PIN надійде у Telegram власника системи.")
             if st.button("📲 Надіслати PIN в Telegram", type="primary", use_container_width=True):
                 with st.spinner("Відправляємо PIN..."):
                     ok = generate_and_send_pin(ip)
@@ -304,7 +208,7 @@ def render_auth_screen(ip: str):
                     st.success("✅ PIN відправлено! Введіть його нижче.")
                     st.rerun()
                 else:
-                    st.error("❌ Telegram недоступний. Перевірте налаштування бота.")
+                    st.error("❌ Telegram недоступний.")
         else:
             st.success("📲 PIN надіслано в Telegram")
             pin_input = st.text_input("Введіть 6-значний PIN", max_chars=6, placeholder="123456", type="password")
@@ -315,8 +219,9 @@ def render_auth_screen(ip: str):
                     if ok:
                         token = create_session(ip)
                         st.session_state.auth_session = token
+                        st.session_state.auth_pin_sent = False
                         _tg_send(f"✅ <b>TITAN — Успішний вхід</b>\nIP: <code>{ip}</code>\nЧас: {datetime.now().strftime('%H:%M:%S')}")
-                        st.success("✅ Авторизовано!")
+                        st.success("✅ Авторизовано! Перенаправлення...")
                         time.sleep(0.5)
                         st.rerun()
                     else:
@@ -325,12 +230,10 @@ def render_auth_screen(ip: str):
                 if st.button("🔄 Новий PIN", use_container_width=True):
                     st.session_state.auth_pin_sent = False
                     st.session_state.temp_pin = None
-                    st.session_state.temp_pin_expires = None
                     st.rerun()
-        st.stop()
+    st.stop()
 
 def require_auth():
-    """Виклик на початку кожного рендеру."""
     ip = _get_client_ip()
     token = st.session_state.get("auth_session", "")
     if not check_session(token, ip):
@@ -1329,9 +1232,7 @@ async def enrich_one_domain(domain: str, cfg: dict, browser) -> dict:
         _buf_log(f"❌ Failed {domain}: {str(e)[:100]}", "error")
         return {"domain": domain, "error": str(e)}
 
-# ════════════════════════════════════════════════
-#  UI — STREAMLIT
-# ════════════════════════════════════════════════
+# ======================== UI ========================
 st.set_page_config(page_title="TITAN v5.0", layout="wide", page_icon="🔱")
 st.markdown("""
 <style>
@@ -1351,14 +1252,13 @@ div[data-testid="stMetricLabel"] { font-size:0.8rem; text-transform:uppercase; l
 </style>
 """, unsafe_allow_html=True)
 
-# ════════ ПЕРЕВІРКА AUTH — ПЕРШИМ РЯДКОМ ════════
+# АВТОРИЗАЦІЯ
 require_auth()
-# ════════════════════════════════════════════════
 
+# ======================== ОСНОВНИЙ ІНТЕРФЕЙС ========================
 st.markdown('<div class="titan-title">🔱 TITAN v5.0 — CAMPAIGN MANAGER + ENRICHMENT</div>', unsafe_allow_html=True)
 st.caption("Secured Edition — Telegram PIN Auth enabled")
 
-# ======================== SIDEBAR ========================
 with st.sidebar:
     st.markdown("### 🔑 API KEYS")
     deepseek_key = st.text_input("DeepSeek API Key ★", type="password")
@@ -1556,7 +1456,6 @@ with tab5:
                         result_holder, done_count = [], [0]
 
                         async def run_enrichment():
-                            sem = asyncio.Semaphore(parallel)
                             async with async_playwright() as pw:
                                 browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-images"])
                                 async def _track(d):
