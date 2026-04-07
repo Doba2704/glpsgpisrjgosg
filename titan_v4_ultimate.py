@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TITAN v5.0 ULTRA — Secured Edition (FULLY FIXED AUTH)
+TITAN v5.0 ULTRA — Secured Edition (FIXED AUTH REDIRECT)
 """
 
 import sys
-import os
 import time
 import threading
 import secrets
@@ -172,7 +171,8 @@ def cleanup_expired():
 threading.Thread(target=cleanup_expired, daemon=True).start()
 
 # ======================== AUTH GATE ========================
-def render_auth_screen(ip: str):
+def render_auth_screen():
+    ip = _get_client_ip()
     st.markdown("""
     <style>
     .stApp { background: radial-gradient(circle at 10% 20%, #0a0f1e, #030712); }
@@ -188,16 +188,19 @@ def render_auth_screen(ip: str):
             <div style="color:#94a3b8">Захищений доступ — потрібна авторизація</div>
         </div>
         """, unsafe_allow_html=True)
+        
         if "auth_pin_sent" not in st.session_state:
             st.session_state.auth_pin_sent = False
         if "auth_session" not in st.session_state:
             st.session_state.auth_session = ""
+            
         with _AUTH_LOCK:
             ban = _banned_ips.get(ip)
         if ban and datetime.now() < ban:
             remaining = int((ban - datetime.now()).total_seconds())
             st.error(f"🚫 Ваш IP заблоковано на {remaining} сек")
             st.stop()
+            
         if not st.session_state.auth_pin_sent:
             st.info(f"🌐 Ваш IP: `{ip}`")
             if st.button("📲 Надіслати PIN в Telegram", type="primary", use_container_width=True):
@@ -219,9 +222,10 @@ def render_auth_screen(ip: str):
                     if ok:
                         token = create_session(ip)
                         st.session_state.auth_session = token
+                        st.session_state.authenticated = True   # <-- ключовий прапорець
                         st.session_state.auth_pin_sent = False
                         _tg_send(f"✅ <b>TITAN — Успішний вхід</b>\nIP: <code>{ip}</code>\nЧас: {datetime.now().strftime('%H:%M:%S')}")
-                        st.success("✅ Авторизовано! Перенаправлення...")
+                        st.success("✅ Авторизовано!")
                         time.sleep(0.5)
                         st.rerun()
                     else:
@@ -234,10 +238,18 @@ def render_auth_screen(ip: str):
     st.stop()
 
 def require_auth():
-    ip = _get_client_ip()
-    token = st.session_state.get("auth_session", "")
-    if not check_session(token, ip):
-        render_auth_screen(ip)
+    if st.session_state.get("authenticated", False):
+        # Перевіряємо, чи сесія ще дійсна
+        ip = _get_client_ip()
+        token = st.session_state.get("auth_session", "")
+        if check_session(token, ip):
+            return  # Вже авторизований
+        else:
+            # Сесія закінчилась
+            st.session_state.authenticated = False
+            st.session_state.auth_session = ""
+            st.session_state.auth_pin_sent = False
+    render_auth_screen()
 
 # ======================== КОНФІГУРАЦІЯ TITAN ========================
 DEFAULT_PARALLEL = 30
@@ -261,6 +273,7 @@ def _init_state():
         "auth_pin_sent": False,
         "temp_pin": None,
         "temp_pin_expires": None,
+        "authenticated": False,   # <-- новий прапорець
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1285,6 +1298,7 @@ with st.sidebar:
             _active_sessions.pop(st.session_state.get("auth_session",""), None)
         st.session_state.auth_session = ""
         st.session_state.auth_pin_sent = False
+        st.session_state.authenticated = False
         st.rerun()
 
     with st.expander("🛡️ Security Admin"):
